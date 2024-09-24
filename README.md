@@ -2,7 +2,7 @@
 
 - Lab1: MapReduce (moderate/hard) - Completed 09/04/2024
 - Lab2: Raft - TODO
-    - Lab2A: leader election (moderate)
+    - Lab2A: leader election (moderate) - Completed 09/24/2024
     - Lab2B: log (hard)
     - Lab2C: persistence (hard)
     - Lab2D: log compaction (hard)
