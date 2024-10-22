@@ -105,10 +105,11 @@ type Raft struct {
 	matchIndex []int // for each server, index of highest log entry known to be replicated on server
 
 	// some utils
-	electionTimeout  time.Time
-	heartbeatTimeout time.Time
-	voteCount        int
-	applyCh          chan ApplyMsg
+	electionTimeout         time.Time
+	heartbeatTimeout        time.Time
+	requestBroadcastTimeout time.Time
+	voteCount               int
+	applyCh                 chan ApplyMsg
 }
 
 // return currentTerm and whether this server
@@ -353,23 +354,25 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 		return ok
 	}
 	rf.mu.Lock()
-	if rf.state == LEADER || args.Term != rf.currentTerm {
-		DPrintf("Already become learder or received vote from last term")
-		rf.mu.Unlock()
-		return false
+	if reply.Term > rf.currentTerm {
+		// If RPC request or response contains term T > currentTerm: set currentTerm = T, convert to follower (§5.1)
+		rf.stepDownToFollower(args.Term)
 	}
-	if reply.VoteGranted {
-		rf.voteCount++
+	if rf.state == CANDIDATE && args.Term == rf.currentTerm {
+		if reply.VoteGranted {
+			rf.voteCount++
+		}
+		// case: C->L: receives votes from majority of servers
+		if rf.voteCount > (len(rf.peers) / 2) {
+			DPrintf("server %v become a leader with term %v", rf.me, rf.currentTerm)
+			rf.voteCount = -1
+			rf.state = LEADER
+			rf.initLeaderStates()
+			// send first HB
+			rf.appendEntryBroadcast()
+		}
 	}
-	// case: C->L: receives votes from majority of servers
-	if rf.voteCount > (len(rf.peers) / 2) {
-		DPrintf("server %v become a leader with term %v", rf.me, rf.currentTerm)
-		rf.voteCount = -1
-		rf.state = LEADER
-		rf.initLeaderStates()
-		// send first HB
-		rf.appendEntryBroadcast(true)
-	}
+
 	rf.mu.Unlock()
 	return ok
 }
@@ -474,7 +477,13 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		rf.logs = append(rf.logs, log)
 		rf.matchIndex[rf.me] = len(rf.logs) - 1
 		DPrintf("server %v receive user command %v", rf.me, command)
-		rf.appendEntryBroadcast(false) // notify other servers
+		now := time.Now()
+		// prevent large requests from user in a short period of time
+		if now.After(rf.requestBroadcastTimeout) {
+			rf.resetRequestBroadcastTimeout()
+			rf.appendEntryBroadcast() // notify other servers
+		}
+
 	}
 	rf.mu.Unlock()
 
@@ -501,13 +510,18 @@ func (rf *Raft) killed() bool {
 }
 
 func (rf *Raft) resetElectionTimeout() {
-	ms := 500 + (rand.Int63() % 150)
+	ms := 300 + (rand.Int63() % 150)
 	rf.electionTimeout = time.Now().Add(time.Duration(ms) * time.Millisecond)
 }
 
 func (rf *Raft) resetHeartbeatTimeout() {
 	ms := 100
 	rf.heartbeatTimeout = time.Now().Add(time.Duration(ms) * time.Millisecond)
+}
+
+func (rf *Raft) resetRequestBroadcastTimeout() {
+	ms := 30
+	rf.requestBroadcastTimeout = time.Now().Add(time.Duration(ms) * time.Millisecond)
 }
 
 func (rf *Raft) startElection() {
@@ -532,21 +546,17 @@ func (rf *Raft) startElection() {
 	}
 }
 
-func (rf *Raft) appendEntryBroadcast(hb bool) {
+func (rf *Raft) appendEntryBroadcast() {
 	// You should lock the mutex before calling this function
 	for server_id, _ := range rf.peers {
 		if server_id != rf.me {
 			entries := []LogEntry{}
-			if !hb {
-				// If last log index ≥ nextIndex for a follower: send
-				// AppendEntries RPC with log entries starting at nextIndex
-				if rf.lastLogIndex() < rf.nextIndex[server_id] {
-					continue
-				} else {
-					entries = append(entries, rf.logs[rf.nextIndex[server_id]])
-				}
-
+			// If last log index ≥ nextIndex for a follower: send
+			// AppendEntries RPC with log entries starting at nextIndex
+			if rf.lastLogIndex() >= rf.nextIndex[server_id] {
+				entries = append(entries, rf.logs[rf.nextIndex[server_id]:]...)
 			}
+
 			args := AppendEntriesArgs{
 				Term:         rf.currentTerm,
 				LeaderId:     rf.me,
@@ -556,15 +566,11 @@ func (rf *Raft) appendEntryBroadcast(hb bool) {
 				LeaderCommit: rf.commitIndex,
 			}
 			reply := AppendEntriesReply{}
-			if !hb {
-				DPrintf("server %v send AE to server %v with command %v and prevLogIdx %v", rf.me, server_id, args.Entries, rf.nextIndex[server_id]-1)
-			}
+			DPrintf("server %v send AE to server %v with command %v and prevLogIdx %v", rf.me, server_id, args.Entries, rf.nextIndex[server_id]-1)
 			go rf.sendAppendEntries(server_id, &args, &reply)
 		}
 	}
-	if hb {
-		rf.resetHeartbeatTimeout()
-	}
+	rf.resetHeartbeatTimeout()
 }
 
 func (rf *Raft) ticker() {
@@ -587,7 +593,7 @@ func (rf *Raft) ticker() {
 			// repeat during idle periods to prevent election timeouts (§5.2)
 			now := time.Now()
 			if now.After(rf.heartbeatTimeout) {
-				rf.appendEntryBroadcast(true)
+				rf.appendEntryBroadcast()
 			}
 		}
 		rf.mu.Unlock()
